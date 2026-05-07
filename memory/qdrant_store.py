@@ -63,7 +63,7 @@ class QdrantMemoryStore:
                     db_id=str(row.id),
                     content=row.content,
                     user_id=row.user_id,
-                    session_id=row.session_id,
+                    session_id=str(row.session_id),
                     created_at=row.created_at,
                     metadata={
                         "role": row.role,
@@ -88,7 +88,7 @@ class QdrantMemoryStore:
                     point_key=f"summary:{row.user_id}:{row.session_id}",
                     content=row.summary,
                     user_id=row.user_id,
-                    session_id=row.session_id,
+                    session_id=str(row.session_id),
                     created_at=row.created_at,
                     metadata={
                         "source_history_ids": row.source_history_ids,

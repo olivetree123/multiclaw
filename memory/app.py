@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 from .config import MemoryConfig, load_memory_config
@@ -10,6 +11,12 @@ from .qdrant_store import MemorySearchResult, QdrantMemoryStore
 from .repository import MemoryRepository
 from .summary_worker import SummaryWorker
 from .tokens import count_message_tokens
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    id: str
+    workspace: str | None
 
 
 class MemoryApp:
@@ -64,6 +71,20 @@ class MemoryApp:
         await self.repository.mark_history_indexed([row.id for row in history_rows])
         await self._wake_summary_worker_if_needed(user_id=user_id, session_id=session_id)
 
+    async def ensure_session(
+        self,
+        *,
+        user_id: str,
+        session_id: str | None = None,
+        workspace: str | None = None,
+    ) -> SessionInfo:
+        session = await self.repository.ensure_session(
+            user_id=user_id,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        return SessionInfo(id=str(session.id), workspace=session.workspace)
+
     async def search(
         self,
         *,
@@ -115,6 +136,19 @@ class MemoryApp:
             label = "Summary" if result.type == "summary" else "History"
             lines.append(f"- [{label}] {result.content}")
         return "\n".join(lines)
+
+    async def get_session_workspace(self, *, user_id: str, session_id: str) -> str | None:
+        return await self.repository.get_session_workspace(
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+    async def set_session_workspace(self, *, user_id: str, session_id: str, workspace: str) -> None:
+        await self.repository.set_session_workspace(
+            user_id=user_id,
+            session_id=session_id,
+            workspace=workspace,
+        )
 
     async def _wake_summary_worker_if_needed(self, *, user_id: str, session_id: str) -> None:
         # 触发判断看完整上下文压力：summary + 未总结 history；

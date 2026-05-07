@@ -1,24 +1,24 @@
 services:
-  app:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: multiclaw-server
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
-      QDRANT_URL: ${QDRANT_URL:?QDRANT_URL is required}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_started
-    # 保持标准输入打开，允许你输入内容。
-    stdin_open: true
-    # 分配终端，让交互体验更像真实命令行。
-    tty: true
+  # app:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile
+  #   container_name: multiclaw-server
+  #   restart: unless-stopped
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+  #     QDRANT_URL: ${QDRANT_URL:?QDRANT_URL is required}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     qdrant:
+  #       condition: service_started
+  #   # 保持标准输入打开，允许你输入内容。
+  #   stdin_open: true
+  #   # 分配终端，让交互体验更像真实命令行。
+  #   tty: true
 
   qdrant:
     image: qdrant/qdrant:v1.17

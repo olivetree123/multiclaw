@@ -25,9 +25,24 @@ ENCODING_BOMS = (
     (b"\xfe\xff", "utf-16-be"),
 )
 
+FILE_WORKSPACE: Path | None = None
+
+
+def configure_file_workspace(workspace: str | None) -> None:
+    global FILE_WORKSPACE
+    FILE_WORKSPACE = Path(workspace).expanduser().resolve() if workspace else None
+
 
 def _to_path(path: str) -> Path:
-    return Path(path).expanduser().resolve()
+    if FILE_WORKSPACE is None:
+        raise PermissionError("File tools are disabled because no workspace was provided.")
+
+    raw_path = Path(path).expanduser()
+    target = raw_path if raw_path.is_absolute() else FILE_WORKSPACE / raw_path
+    resolved = target.resolve()
+    if resolved != FILE_WORKSPACE and FILE_WORKSPACE not in resolved.parents:
+        raise PermissionError(f"Path is outside workspace: {resolved}")
+    return resolved
 
 
 def detect_file_encoding(path: str, sample_size: int = 64 * 1024) -> dict[str, Any]:
