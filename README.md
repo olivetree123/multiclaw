@@ -1,5 +1,18 @@
 # MultiClaw
 
+## 运行
+```shell
+# 1. 请先编辑环境变量 ./docker/.env
+
+# 2. 启动数据库
+cd docker
+docker compose -f docker-compose.yaml up -d
+
+# 3. 启动agent服务
+cd ..
+uv run python main.py --workspace /home/ubuntu/myproject
+```
+
 ## 一些说明
 1. `The command is not run through a system shell`
 
