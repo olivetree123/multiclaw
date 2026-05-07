@@ -1,0 +1,13 @@
+[project]
+name = "multiclaw"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "litellm>=1.83.14",
+    "qdrant-client>=1.17.1",
+    "tortoise-orm>=1.1.7",
+    "tzdata>=2026.2",
+]
