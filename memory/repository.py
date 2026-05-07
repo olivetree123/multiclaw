@@ -117,6 +117,50 @@ class MemoryRepository:
             .order_by("created_at")
         )
 
+    async def get_latest_history(self, *, user_id: str, session_id: str) -> History | None:
+        return await (
+            History.filter(
+                user_id=user_id,
+                session_id=self._session_uuid(session_id),
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+    async def get_unindexed_history(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        limit: int,
+    ) -> list[History]:
+        return await (
+            History.filter(
+                user_id=user_id,
+                session_id=self._session_uuid(session_id),
+                indexed_at__isnull=True,
+            )
+            .order_by("created_at")
+            .limit(limit)
+        )
+
+    async def get_unindexed_memory(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        limit: int,
+    ) -> list[Memory]:
+        return await (
+            Memory.filter(
+                user_id=user_id,
+                session_id=self._session_uuid(session_id),
+                indexed_at__isnull=True,
+            )
+            .order_by("created_at")
+            .limit(limit)
+        )
+
     async def get_pending_token_count(self, *, user_id: str, session_id: str) -> int:
         rows = await self.get_pending_history(user_id=user_id, session_id=session_id)
         return sum(row.token_count for row in rows)

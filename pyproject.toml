@@ -9,6 +9,7 @@ dependencies = [
     "click>=8.1.8",
     "litellm>=1.83.14",
     "qdrant-client>=1.17.1",
+    "rich>=15.0.0",
     "tortoise-orm>=1.1.7",
     "tzdata>=2026.2",
     "uuid6>=2025.0.1",

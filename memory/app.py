@@ -13,6 +13,9 @@ from .summary_worker import SummaryWorker
 from .tokens import count_message_tokens
 
 
+RECOVERY_ASSISTANT_MESSAGE = "上一轮对话因系统中断未完成，没有生成有效回复。请重新发送该请求。"
+
+
 @dataclass(frozen=True)
 class SessionInfo:
     id: str
@@ -70,6 +73,58 @@ class MemoryApp:
         await asyncio.to_thread(self.qdrant_store.upsert_history, history_rows)
         await self.repository.mark_history_indexed([row.id for row in history_rows])
         await self._wake_summary_worker_if_needed(user_id=user_id, session_id=session_id)
+
+    async def repair_incomplete_turn(self, *, user_id: str, session_id: str) -> bool:
+        latest = await self.repository.get_latest_history(user_id=user_id, session_id=session_id)
+        if latest is None or latest.role != "user":
+            return False
+
+        await self.repository.add_history_messages(
+            session_id=session_id,
+            user_id=user_id,
+            messages=[{
+                "role": "assistant",
+                "content": RECOVERY_ASSISTANT_MESSAGE,
+                "token_count": count_message_tokens(
+                    {"role": "assistant", "content": RECOVERY_ASSISTANT_MESSAGE},
+                    model=self.config.llm_model,
+                ),
+                "recovery": True,
+            }],
+        )
+        return True
+
+    async def reindex_unindexed(self, *, user_id: str, session_id: str, batch_size: int = 100) -> int:
+        indexed_count = 0
+
+        while True:
+            history_rows = await self.repository.get_unindexed_history(
+                user_id=user_id,
+                session_id=session_id,
+                limit=batch_size,
+            )
+            if not history_rows:
+                break
+
+            # PostgreSQL 是主存储；Qdrant 只是派生索引，启动时可以安全地重复 upsert。
+            await asyncio.to_thread(self.qdrant_store.upsert_history, history_rows)
+            await self.repository.mark_history_indexed([row.id for row in history_rows])
+            indexed_count += len(history_rows)
+
+        while True:
+            memory_rows = await self.repository.get_unindexed_memory(
+                user_id=user_id,
+                session_id=session_id,
+                limit=batch_size,
+            )
+            if not memory_rows:
+                break
+
+            await asyncio.to_thread(self.qdrant_store.upsert_memory, memory_rows)
+            await self.repository.mark_memory_indexed([row.id for row in memory_rows])
+            indexed_count += len(memory_rows)
+
+        return indexed_count
 
     async def ensure_session(
         self,
