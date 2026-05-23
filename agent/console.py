@@ -11,24 +11,28 @@ class AgentConsole:
     def input_message(self) -> str:
         return self.console.input("[bold cyan]Enter your message:[/bold cyan] ")
 
-    def print_user_message(self, content: str) -> None:
-        self.console.print(Panel(content, title="User", border_style="cyan"))
+    def print_user_message(self, content: str, *, label: str | None = None) -> None:
+        title = label or "User"
+        self.console.print(Panel(content, title=title, border_style="cyan"))
 
-    def print_thinking(self, content: str) -> None:
+    def print_thinking(self, content: str, *, label: str | None = None) -> None:
         if content:
-            self.console.print(Panel(content, title="Think", border_style="yellow"))
+            title = f"{label} Think" if label else "Think"
+            self.console.print(Panel(content, title=title, border_style="yellow"))
 
-    def print_assistant_message(self, content: str) -> None:
-        self.console.print(Panel(content or "", title="Assistant", border_style="green"))
+    def print_assistant_message(self, content: str, *, label: str | None = None) -> None:
+        title = label or "Assistant"
+        self.console.print(Panel(content or "", title=title, border_style="green"))
 
-    def print_tool_call(self, tool_name: str, tool_arguments: str) -> None:
+    def print_tool_call(self, tool_name: str, tool_arguments: str, *, label: str | None = None) -> None:
         argument_preview = tool_arguments[:100]
         if len(tool_arguments) > 100:
             argument_preview = f"{argument_preview}..."
+        title = f"{label} Tool Call" if label else "Tool Call"
         self.console.print(
             Panel(
                 f"{tool_name}\n\n{argument_preview}",
-                title="Tool Call",
+                title=title,
                 border_style="magenta",
             )
         )

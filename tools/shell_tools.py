@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +12,18 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
 
-SHELL_WORKSPACE: Path | None = None
+SHELL_WORKSPACE: ContextVar[Path | None] = ContextVar("shell_workspace", default=None)
 DEFAULT_ALLOWED_COMMANDS = {"curl", "curl.exe", "summarize", "summarize.exe"}
 CURL_BLOCKED_ARGS = {"-o", "--output", "-O", "--remote-name", "-K", "--config"}
 console = Console()
 
 
 def configure_shell_workspace(workspace: str | None) -> None:
-    global SHELL_WORKSPACE
-    SHELL_WORKSPACE = Path(workspace).expanduser().resolve() if workspace else None
+    SHELL_WORKSPACE.set(Path(workspace).expanduser().resolve() if workspace else None)
+
+
+def _current_shell_workspace() -> Path | None:
+    return SHELL_WORKSPACE.get()
 
 
 def execute_shell_command(command: str, timeout_seconds: int = 30) -> dict[str, Any]:
@@ -37,9 +41,10 @@ def execute_shell_command(command: str, timeout_seconds: int = 30) -> dict[str, 
 
     _validate_command_args(executable, args[1:])
 
+    shell_workspace = _current_shell_workspace()
     completed = subprocess.run(
         args,
-        cwd=str(SHELL_WORKSPACE) if SHELL_WORKSPACE else None,
+        cwd=str(shell_workspace) if shell_workspace else None,
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
@@ -93,7 +98,8 @@ def _validate_curl_args(args: list[str]) -> None:
 
 
 def _validate_summarize_args(args: list[str]) -> None:
-    if SHELL_WORKSPACE is None:
+    shell_workspace = _current_shell_workspace()
+    if shell_workspace is None:
         raise PermissionError("summarize is disabled because no workspace was provided.")
 
     for arg in args:
@@ -103,10 +109,14 @@ def _validate_summarize_args(args: list[str]) -> None:
 
 
 def _resolve_workspace_path(path: str) -> Path:
+    shell_workspace = _current_shell_workspace()
+    if shell_workspace is None:
+        raise PermissionError("Shell tools are disabled because no workspace was provided.")
+
     raw_path = Path(path).expanduser()
-    target = raw_path if raw_path.is_absolute() else SHELL_WORKSPACE / raw_path
+    target = raw_path if raw_path.is_absolute() else shell_workspace / raw_path
     resolved = target.resolve()
-    if resolved != SHELL_WORKSPACE and SHELL_WORKSPACE not in resolved.parents:
+    if resolved != shell_workspace and shell_workspace not in resolved.parents:
         raise PermissionError(f"Path is outside workspace: {resolved}")
     return resolved
 

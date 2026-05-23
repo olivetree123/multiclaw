@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import locale
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -25,22 +26,26 @@ ENCODING_BOMS = (
     (b"\xfe\xff", "utf-16-be"),
 )
 
-FILE_WORKSPACE: Path | None = None
+FILE_WORKSPACE: ContextVar[Path | None] = ContextVar("file_workspace", default=None)
 
 
 def configure_file_workspace(workspace: str | None) -> None:
-    global FILE_WORKSPACE
-    FILE_WORKSPACE = Path(workspace).expanduser().resolve() if workspace else None
+    FILE_WORKSPACE.set(Path(workspace).expanduser().resolve() if workspace else None)
+
+
+def _current_file_workspace() -> Path | None:
+    return FILE_WORKSPACE.get()
 
 
 def _to_path(path: str) -> Path:
-    if FILE_WORKSPACE is None:
+    file_workspace = _current_file_workspace()
+    if file_workspace is None:
         raise PermissionError("File tools are disabled because no workspace was provided.")
 
     raw_path = Path(path).expanduser()
-    target = raw_path if raw_path.is_absolute() else FILE_WORKSPACE / raw_path
+    target = raw_path if raw_path.is_absolute() else file_workspace / raw_path
     resolved = target.resolve()
-    if resolved != FILE_WORKSPACE and FILE_WORKSPACE not in resolved.parents:
+    if resolved != file_workspace and file_workspace not in resolved.parents:
         raise PermissionError(f"Path is outside workspace: {resolved}")
     return resolved
 
