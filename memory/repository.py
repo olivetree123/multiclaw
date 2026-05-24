@@ -18,9 +18,12 @@ class MemoryRepository:
     async def initialize(self) -> None:
         if self._initialized:
             return
+        if Tortoise.is_inited():
+            self._initialized = True
+            return
         await Tortoise.init(
             db_url=self.database_url,
-            modules={"models": ["memory.models"]},
+            modules={"models": ["memory.models", "auth.models", "api.models"]},
         )
         await Tortoise.generate_schemas(safe=True)
         await self._configure_postgres_uuidv7_defaults()
@@ -283,10 +286,12 @@ class MemoryRepository:
     async def get_memory(self, memory_id: uuid.UUID) -> Memory | None:
         return await Memory.get_or_none(id=memory_id)
 
-    async def close(self) -> None:
-        if self._initialized:
+    async def close(self, *, close_connections: bool = True) -> None:
+        if not self._initialized:
+            return
+        if close_connections:
             await Tortoise.close_connections()
-            self._initialized = False
+        self._initialized = False
 
     async def _configure_postgres_uuidv7_defaults(self) -> None:
         if not self.database_url.startswith("postgres://"):

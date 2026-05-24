@@ -13,6 +13,11 @@ from memory import MemoryApp
 from tools import call_tool, get_tool_schemas
 
 from .console import AgentConsole
+from .message_history import (
+    history_row_to_message,
+    sanitize_messages_for_llm,
+    synthetic_tool_messages,
+)
 from .prompt import PromptBuilder
 
 ToolHandler = Callable[[str, str], Awaitable[Any]]
@@ -38,6 +43,7 @@ class AgentRunner:
         console: AgentConsole | None = None,
         memory_app: MemoryApp | None = None,
         start_worker: bool = True,
+        owns_memory_app: bool | None = None,
     ) -> None:
         self.requested_workspace = workspace
         self.requested_session_id = session_id
@@ -45,7 +51,11 @@ class AgentRunner:
         self.label = label
         self.console = console or AgentConsole()
         self.memory_app = memory_app or MemoryApp(start_worker=start_worker)
+        self._owns_memory_app = (
+            owns_memory_app if owns_memory_app is not None else memory_app is None
+        )
         self.history: list[dict[str, Any]] = []
+        self._history_restored = False
         self._session_id: str | None = None
         self._workspace: Path | None = None
         self._initialized = False
@@ -76,8 +86,13 @@ class AgentRunner:
 
     async def close(self) -> None:
         if not self._initialized:
+            self.history = []
+            self._history_restored = False
             return
-        await self.memory_app.close()
+        if self._owns_memory_app:
+            await self.memory_app.close()
+        self.history = []
+        self._history_restored = False
         self._initialized = False
 
     async def initialize(self) -> tuple[str, Path | None]:
@@ -92,7 +107,13 @@ class AgentRunner:
         self._initialized = True
         return session_id, workspace
 
-    async def run_task(self, user_message: str) -> str:
+    async def run_task(
+        self,
+        user_message: str,
+        *,
+        extra_tool_schemas: list[dict[str, Any]] | None = None,
+        tool_handler: ToolHandler | None = None,
+    ) -> str:
         """执行单个任务并返回 assistant 最终回复，不读取 stdin。"""
         session_id, workspace = await self.initialize()
         prompt_builder = PromptBuilder(
@@ -105,6 +126,8 @@ class AgentRunner:
             workspace=workspace,
             prompt_builder=prompt_builder,
             user_message=user_message,
+            extra_tool_schemas=extra_tool_schemas,
+            tool_handler=tool_handler,
             print_user=False,
         )
 
@@ -120,11 +143,14 @@ class AgentRunner:
 
         self.console.print_session(session_id=session_id, workspace=workspace)
 
+        await self._restore_history_if_needed(session_id=session_id)
+
         repaired = await self.memory_app.repair_incomplete_turn(
             user_id=self.memory_app.config.user_id,
             session_id=session_id,
         )
         if repaired:
+            await self._restore_history_if_needed(session_id=session_id, force=True)
             self.console.print_status("Recovered an incomplete previous turn.")
 
         try:
@@ -210,6 +236,7 @@ class AgentRunner:
         workspace_value = str(workspace) if workspace else None
 
         while True:
+            llm_messages = sanitize_messages_for_llm(self.history)
             response = await asyncio.to_thread(
                 completion,
                 model=os.getenv("LLM_MODEL"),
@@ -220,7 +247,7 @@ class AgentRunner:
                 messages=[{
                     "role": "system",
                     "content": system_prompt,
-                }] + self.history,
+                }] + llm_messages,
             )
 
             assistant_message = _message_to_dict(response["choices"][0]["message"])
@@ -240,23 +267,59 @@ class AgentRunner:
                 tool_arguments = function_call.get("arguments", "{}")
                 self.console.print_tool_call(tool_name, tool_arguments, label=self.label)
 
-                if tool_handler is not None:
-                    tool_result = await tool_handler(tool_name, tool_arguments)
-                else:
-                    tool_result = call_tool(
-                        tool_name,
-                        tool_arguments,
-                        file_tools_enabled=file_tools_enabled,
-                        workspace=workspace_value,
-                    )
+                try:
+                    if tool_handler is not None:
+                        tool_result = await tool_handler(tool_name, tool_arguments)
+                    else:
+                        tool_result = call_tool(
+                            tool_name,
+                            tool_arguments,
+                            file_tools_enabled=file_tools_enabled,
+                            workspace=workspace_value,
+                        )
+                    tool_content = _tool_result_to_content(tool_result)
+                except Exception as error:
+                    tool_content = f"Tool error: {error}"
 
                 tool_message = {
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "name": tool_name,
-                    "content": _tool_result_to_content(tool_result),
+                    "content": tool_content,
                 }
+                self.console.print_tool_result(
+                    tool_name,
+                    tool_message["content"],
+                    label=self.label,
+                )
                 await self._append_history_message(session_id=session_id, message=tool_message)
+
+            self.history = sanitize_messages_for_llm(self.history)
+
+    async def _restore_history_if_needed(
+        self,
+        *,
+        session_id: str,
+        force: bool = False,
+    ) -> None:
+        if self._history_restored and not force:
+            return
+
+        rows = await self.memory_app.repository.get_pending_history(
+            user_id=self.memory_app.config.user_id,
+            session_id=session_id,
+        )
+        loaded = [history_row_to_message(row) for row in rows]
+        repaired = sanitize_messages_for_llm(loaded)
+        placeholders = synthetic_tool_messages(loaded, repaired)
+        if placeholders:
+            await self.memory_app.add_messages(
+                session_id=session_id,
+                user_id=self.memory_app.config.user_id,
+                messages=placeholders,
+            )
+        self.history = repaired
+        self._history_restored = True
 
     async def _append_history_message(self, *, session_id: str, message: dict[str, Any]) -> None:
         self.history.append(message)

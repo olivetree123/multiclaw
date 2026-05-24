@@ -21,6 +21,7 @@ class MemorySearchResult:
 
 
 class QdrantMemoryStore:
+
     def __init__(
         self,
         *,
@@ -31,7 +32,7 @@ class QdrantMemoryStore:
     ) -> None:
         self.collection_name = collection_name
         self.embedding_provider = embedding_provider
-        self.client = QdrantClient(url=url, api_key=api_key)
+        self.client = QdrantClient(url=url)
 
     def ensure_collection(self) -> None:
         if self.client.collection_exists(self.collection_name):
@@ -40,15 +41,14 @@ class QdrantMemoryStore:
         self.client.create_collection(
             collection_name=self.collection_name,
             vectors_config={
-                "dense": models.VectorParams(
+                "dense":
+                models.VectorParams(
                     size=self.embedding_provider.dimensions,
                     distance=models.Distance.COSINE,
                 )
             },
             sparse_vectors_config={
-                "sparse": models.SparseVectorParams(
-                    index=models.SparseIndexParams(on_disk=False)
-                )
+                "sparse": models.SparseVectorParams(index=models.SparseIndexParams(on_disk=False))
             },
         )
 
@@ -56,64 +56,57 @@ class QdrantMemoryStore:
         if not rows:
             return
 
-        self._upsert_points(
-            [
-                self._point(
-                    item_type="history",
-                    db_id=str(row.id),
-                    content=row.content,
-                    user_id=row.user_id,
-                    session_id=str(row.session_id),
-                    created_at=row.created_at,
-                    metadata={
-                        "role": row.role,
-                        "is_summarized": row.is_summarized,
-                        "token_count": row.token_count,
-                        **(row.extra_metadata or {}),
-                    },
-                )
-                for row in rows
-            ]
-        )
+        self._upsert_points([
+            self._point(
+                item_type="history",
+                db_id=str(row.id),
+                content=row.content,
+                user_id=row.user_id,
+                session_id=str(row.session_id),
+                created_at=row.created_at,
+                metadata={
+                    "role": row.role,
+                    "is_summarized": row.is_summarized,
+                    "token_count": row.token_count,
+                    **(row.extra_metadata or {}),
+                },
+            ) for row in rows
+        ])
 
     def upsert_memory(self, rows: list[Memory]) -> None:
         if not rows:
             return
 
-        self._upsert_points(
-            [
-                self._point(
-                    item_type="summary",
-                    db_id=str(row.id),
-                    point_key=f"summary:{row.user_id}:{row.session_id}",
-                    content=row.summary,
-                    user_id=row.user_id,
-                    session_id=str(row.session_id),
-                    created_at=row.created_at,
-                    metadata={
-                        "source_history_ids": row.source_history_ids,
-                        **(row.extra_metadata or {}),
-                    },
-                )
-                for row in rows
-            ]
-        )
+        self._upsert_points([
+            self._point(
+                item_type="summary",
+                db_id=str(row.id),
+                point_key=f"summary:{row.user_id}:{row.session_id}",
+                content=row.summary,
+                user_id=row.user_id,
+                session_id=str(row.session_id),
+                created_at=row.created_at,
+                metadata={
+                    "source_history_ids": row.source_history_ids,
+                    **(row.extra_metadata or {}),
+                },
+            ) for row in rows
+        ])
 
-    def search(self, *, query: str, user_id: str, session_id: str, limit: int) -> list[MemorySearchResult]:
+    def search(self, *, query: str, user_id: str, session_id: str,
+               limit: int) -> list[MemorySearchResult]:
         dense = self.embedding_provider.dense(query)
         sparse_indices, sparse_values = self.embedding_provider.sparse(query)
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="user_id",
-                    match=models.MatchValue(value=user_id),
-                ),
-                models.FieldCondition(
-                    key="session_id",
-                    match=models.MatchValue(value=session_id),
-                )
-            ]
-        )
+        query_filter = models.Filter(must=[
+            models.FieldCondition(
+                key="user_id",
+                match=models.MatchValue(value=user_id),
+            ),
+            models.FieldCondition(
+                key="session_id",
+                match=models.MatchValue(value=session_id),
+            )
+        ])
 
         if not sparse_indices:
             response = self.client.query_points(

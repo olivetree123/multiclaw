@@ -30,10 +30,17 @@ class MemoryApp:
     进入这些能力，避免在 agent 主流程里散落数据库和索引细节。
     """
 
-    def __init__(self, config: MemoryConfig | None = None, *, start_worker: bool = True) -> None:
+    def __init__(
+        self,
+        config: MemoryConfig | None = None,
+        *,
+        start_worker: bool = True,
+        close_database_connections: bool = True,
+    ) -> None:
         self.config = config or load_memory_config()
         self.repository = MemoryRepository(self.config.database_url)
         self.start_worker = start_worker
+        self.close_database_connections = close_database_connections
 
         embedding_provider = HashEmbeddingProvider(dimensions=self.config.embedding_dimensions)
         self.qdrant_store = QdrantMemoryStore(
@@ -292,4 +299,4 @@ class MemoryApp:
         """关闭后台 worker、Qdrant client 和数据库连接。"""
         await self.summary_worker.stop()
         await asyncio.to_thread(self.qdrant_store.close)
-        await self.repository.close()
+        await self.repository.close(close_connections=self.close_database_connections)

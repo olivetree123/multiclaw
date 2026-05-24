@@ -86,8 +86,10 @@ my-project/
 
 - **职责**：分析需求、追问澄清、撰写 PRD，写入 `docs/requirements.md`
 - **操作**：描述你想做的产品，与产品经理反复对话
-- **进入下一阶段**：输入 `确认需求`、`需求确认` 或 `开始开发`
+- **进入下一阶段**：输入 `确认需求`、`需求确认` 或 `开始开发`；或产品经理回复中含 `<!-- STATUS: confirmed -->`
 - **退出**：输入 `exit`
+
+信息不足时，产品经理会在回复中标记 `<!-- STATUS: needs_clarification -->`。在 **HTTP API 模式**下，系统会自动将其转为结构化澄清表单（见下文「需求澄清表单」）。
 
 示例：
 
@@ -152,6 +154,310 @@ uv run python main.py --continue --project-root ./my-project --session-id <之�
 - `--continue` 会检测 `docs/requirements.md`、`backend/docs/openapi.yaml` 或 `frontend/` 是否存在
 - 建议配合 `--session-id` 使用，以恢复各 Agent 的对话记忆
 - 若不传 `--session-id`，仍会从磁盘加载需求与 API 文件作为上下文，但 Agent memory 为新会话
+
+---
+
+## HTTP API 模式
+
+> 完整接口文档见 **[API.md](./API.md)**，供前端项目对接。
+
+将多 Agent 流程封装为 REST API，便于集成到 Web 前端或其他服务。
+
+### 启动服务
+
+```shell
+uv run python main.py --serve --host 0.0.0.0 --port 8000
+```
+
+启动后访问 `http://localhost:8000/docs` 查看 Swagger 文档。
+
+### 接口说明
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/health` | 健康检查 |
+| `GET` | `/api/v1/sessions` | 获取会话列表 |
+| `POST` | `/api/v1/sessions` | 创建会话 |
+| `GET` | `/api/v1/sessions/{session_id}` | 查询会话详情 |
+| `PATCH` | `/api/v1/sessions/{session_id}` | 修改会话工作目录 |
+| `GET` | `/api/v1/sessions/{session_id}/messages` | 获取会话消息列表 |
+| `POST` | `/api/v1/sessions/{session_id}/messages` | 发送用户消息（`stream: true` 时返回 SSE） |
+| `POST` | `/api/v1/sessions/{session_id}/messages/stream` | 发送用户消息（SSE 流式） |
+| `DELETE` | `/api/v1/sessions/{session_id}` | 删除会话 |
+
+### 创建会话
+
+```shell
+curl -X POST http://localhost:8000/api/v1/sessions \
+  -H "Content-Type: application/json" \
+  -d "{\"project_root\": \"./my-project\"}"
+```
+
+响应示例：
+
+```json
+{
+  "session_id": "api-会话ID",
+  "memory_session_id": "底层-memory-UUID",
+  "phase": "requirements",
+  "project_root": "D:/code/my-project",
+  "messages": [
+    {"role": "status", "content": "多 Agent 项目根目录：...", "agent": null},
+    {"role": "status", "content": "【阶段 1/4】需求确认...", "agent": null}
+  ]
+}
+```
+
+直接进入维护阶段：
+
+```json
+{
+  "project_root": "./my-project",
+  "continue_maintenance": true,
+  "memory_session_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+### 发送消息
+
+```shell
+curl -X POST http://localhost:8000/api/v1/sessions/{session_id}/messages \
+  -H "Content-Type: application/json" \
+  -d "{\"message\": \"做一个 Todo 应用，支持优先级和截止日期\"}"
+```
+
+响应字段：
+
+| 字段 | 说明 |
+|------|------|
+| `phase` | 当前阶段（requirements / prototype / backend / integration / maintenance） |
+| `phase_changed` | 本次消息是否触发了阶段切换 |
+| `requirements_form` | 需求澄清表单 JSON；无待填表单时为 `null` |
+| `messages` | 状态提示（`role=status`）与 Agent 回复（`role=assistant`） |
+
+阶段切换关键词与 CLI 模式相同，例如：`确认需求`、`确认样品`、`开始对接`、`进入维护`。
+
+### 需求澄清表单
+
+在 `requirements` 阶段，若产品经理认为信息不足，会在回复中带上 `<!-- STATUS: needs_clarification -->`（或文本 `status: needs_clarification`）。此时服务端会**额外调用一次大模型**，把澄清问题转成前端可渲染的 JSON 表单，并写入会话的 `requirements_form` 字段（PostgreSQL `api_session` 表）。
+
+#### 工作流程
+
+```
+用户描述需求
+    │
+    ▼
+产品经理 Agent 回复
+    │
+    ├─ needs_clarification ──► 调用 generate_clarification_form()
+    │                              │
+    │                              ▼
+    │                         生成 JSON 表单 → 写入 requirements_form
+    │                              │
+    │                              ▼
+    │                         SSE: form + done.requirements_form
+    │
+    ├─ confirmed ───────────► 清空 requirements_form，进入 prototype
+    │
+    └─ 普通回复（无 status）──► 清空 requirements_form
+```
+
+用户提交表单答案或直接发送聊天消息时，服务端在**开始处理该条消息前**立即将 `requirements_form` 置为 `null`（SSE 会先发 `form_clear`），避免处理过程中页面仍显示旧表单。若产品经理本轮仍返回 `needs_clarification`，处理结束后再写入新表单。
+
+#### 表单 JSON 格式
+
+```json
+{
+  "id": "req-clarify-a1b2c3d4",
+  "title": "需求澄清",
+  "status": "needs_clarification",
+  "fields": [
+    {
+      "id": "target_user",
+      "label": "目标用户与场景",
+      "type": "radio",
+      "required": true,
+      "options": [
+        { "value": "personal", "label": "个人使用" },
+        { "value": "team", "label": "团队协作" }
+      ]
+    },
+    {
+      "id": "extra_notes",
+      "label": "其他补充",
+      "type": "textarea",
+      "required": false,
+      "placeholder": "只回答部分问题也可以"
+    }
+  ]
+}
+```
+
+支持的 `type`：`radio`、`checkbox`、`select`、`text`、`textarea`。
+
+#### 如何获取表单
+
+| 方式 | 字段 / 事件 |
+|------|-------------|
+| `GET /api/v1/sessions/{session_id}` | 响应体 `requirements_form` |
+| `POST /api/v1/sessions/{id}/messages` | 响应体 `requirements_form` |
+| SSE `event: form` | 完整表单 JSON |
+| SSE `event: form_clear` | 用户已回复，立即隐藏当前表单 |
+| SSE `event: done` | `data.requirements_form` |
+
+产品经理的 Markdown 澄清说明仍通过 `event: assistant` 返回；表单 JSON 供前端单独渲染为控件。
+
+#### 用户未填表单、直接发聊天消息时
+
+澄清表单与聊天**共用** `POST /messages` 通道。用户可以直接输入文字，而不必提交表单。
+
+**用户发送消息时**（无论是否填写表单）：服务端立即清空 `requirements_form`，流式模式下先发 `event: form_clear`。
+
+**Agent 处理完成后**，根据产品经理**本轮**回复更新 `requirements_form`：
+
+| 产品经理本轮回复 | `requirements_form` 处理 |
+|------------------|--------------------------|
+| 仍含 `needs_clarification` | **更新**为新表单（覆盖旧值） |
+| 含 `confirmed` / 阶段进入 `prototype` | **清空**（`null`） |
+| 普通回复（无上述 status） | **清空**（`null`） |
+
+用户通过聊天补充的内容会进入产品经理 Agent 的对话记忆；若仍需澄清，下一轮会生成新的表单。需求确认完成后表单不再出现。
+
+#### 前端建议
+
+- 收到 `form` 或 `requirements_form` 非空时，渲染表单；`assistant` 事件展示说明文字
+- 用户发送消息后立即隐藏表单（或监听 `form_clear`）；用户可**填表单后通过聊天发送汇总**（将答案格式化为一条消息），或直接**在聊天框补充**——两种方式等价，均走 `POST /messages`
+- 收到 `done` 且 `phase` 仍为 `requirements` 时，根据 `requirements_form` 是否为 `null` 决定是否再次展示表单
+- `event: assistant` 与 `done.messages` 中 assistant 内容可能相同，展示时避免重复渲染（见 [API.md](./API.md)）
+
+### SSE 流式发送（推荐前端使用）
+
+Agent 执行可能耗时较长，建议用 SSE 实时接收进度，并在收到 `done` 事件时判定完成。
+
+**方式 1：** 请求体设 `stream: true`
+
+```shell
+curl -N -X POST http://localhost:8000/api/v1/sessions/{session_id}/messages \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d "{\"message\": \"做一个 Todo 应用\", \"stream\": true}"
+```
+
+**方式 2：** 专用流式端点
+
+```shell
+curl -N -X POST http://localhost:8000/api/v1/sessions/{session_id}/messages/stream \
+  -H "Content-Type: application/json" \
+  -d "{\"message\": \"做一个 Todo 应用\"}"
+```
+
+**事件类型：**
+
+| 事件 | 说明 |
+|------|------|
+| `started` | 开始处理用户消息 |
+| `status` | 阶段提示、状态变更 |
+| `thinking` | Agent 推理过程（若模型支持） |
+| `tool_call` | 工具调用开始 |
+| `tool_result` | 工具执行结果摘要 |
+| `assistant` | Agent 回复内容 |
+| `form` | 需求澄清表单 JSON（仅 `requirements` 阶段且 PM 返回 `needs_clarification` 时） |
+| `form_clear` | 用户已回复，立即隐藏当前澄清表单 |
+| `done` | **执行完成**，含 `phase`、`phase_changed`、`requirements_form`、`messages` |
+| `error` | 执行出错 |
+
+**前端示例（fetch + 流式解析）：**
+
+```javascript
+const response = await fetch(`/api/v1/sessions/${sessionId}/messages/stream`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ message: userInput }),
+});
+
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+
+  const parts = buffer.split("\n\n");
+  buffer = parts.pop() ?? "";
+
+  for (const part of parts) {
+    const eventLine = part.match(/^event: (.+)/m)?.[1];
+    const dataLine = part.match(/^data: (.+)/m)?.[1];
+    if (!eventLine || !dataLine) continue;
+
+    const data = JSON.parse(dataLine);
+    if (eventLine === "done") {
+      setLoading(false);  // Agent 执行完成
+      setPhase(data.phase);
+      setRequirementsForm(data.requirements_form ?? null);
+    } else if (eventLine === "error") {
+      setLoading(false);
+      showError(data.detail);
+    } else if (eventLine === "form") {
+      setRequirementsForm(data);
+    } else if (eventLine === "form_clear") {
+      setRequirementsForm(null);
+    } else if (eventLine === "assistant") {
+      appendAssistant(data.content, data.agent);
+    }
+  }
+}
+```
+
+> 注意：SSE 通过 POST 发送时需用 `fetch` 读取流；`EventSource` 仅支持 GET。
+
+### 获取会话列表
+
+```shell
+curl http://localhost:8000/api/v1/sessions
+```
+
+### 修改工作目录
+
+```shell
+curl -X PATCH http://localhost:8000/api/v1/sessions/{session_id} \
+  -H "Content-Type: application/json" \
+  -d "{\"project_root\": \"./another-project\"}"
+```
+
+修改后会重建各 Agent 的工作区绑定；若处于维护阶段，会重新加载新目录下的项目上下文。
+
+### 获取消息列表
+
+```shell
+curl http://localhost:8000/api/v1/sessions/{session_id}/messages
+```
+
+返回该会话的全部历史消息（含 `user`、`status`、`assistant`），按时间顺序排列。
+
+### 删除会话
+
+```shell
+curl -X DELETE http://localhost:8000/api/v1/sessions/{session_id}
+```
+
+### 典型调用流程
+
+```
+1. POST /api/v1/sessions          → 获取 session_id
+2. POST /api/v1/sessions/{id}/messages  {"message": "描述需求..."}
+3. POST /api/v1/sessions/{id}/messages  {"message": "确认需求"}
+4. ... 按阶段继续发送消息 ...
+5. DELETE /api/v1/sessions/{id}   → 结束会话
+```
+
+说明：
+
+- `session_id` 是 API 层会话 ID；`memory_session_id` 是底层 memory 会话，可通过创建会话时传入以恢复历史
+- 同一会话的消息会串行处理，请勿并发发送
+- 会话元数据与消息历史持久化在 PostgreSQL；服务重启后可继续会话，活跃 Runner 会在首次发消息时懒加载恢复
 
 ---
 

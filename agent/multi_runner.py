@@ -3,11 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
+from memory import MemoryApp
+from memory.config import load_memory_config
+
+from .console import AgentConsole, SilentAgentConsole, StreamingAgentConsole
 from .delegate_tools import build_delegate_tool_schemas, parse_delegate_tool_name
+from .requirements_form import generate_clarification_form, needs_clarification
 from .runner import AgentRunner
+from .stream_events import StreamEvent
 from .specs import (
     ACTIVE_AGENT_SPECS,
     BACKEND_SPEC,
@@ -65,6 +73,22 @@ MAINTENANCE_START_PHRASES = (
 )
 
 
+@dataclass
+class AgentReply:
+    role: str
+    content: str
+    agent: str | None = None
+
+
+@dataclass
+class SubmitResult:
+    phase: Phase
+    phase_changed: bool
+    memory_session_id: str
+    messages: list[AgentReply] = field(default_factory=list)
+    requirements_form: dict | None = None
+
+
 class MultiAgentRunner:
     """协调多个 AgentRunner：线性开发流程 + 维护阶段。"""
 
@@ -75,6 +99,9 @@ class MultiAgentRunner:
         session_id: str | None = None,
         agent_specs: tuple[AgentSpec, ...] = ACTIVE_AGENT_SPECS,
         continue_maintenance: bool = False,
+        console: AgentConsole | None = None,
+        user_id: str | None = None,
+        close_database_connections: bool = True,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.agent_specs = agent_specs
@@ -86,85 +113,295 @@ class MultiAgentRunner:
         self.backend_result: str | None = None
         self._sub_agents: dict[str, AgentRunner] = {}
         self._coordinator: AgentRunner | None = None
+        self._console = console
+        self._shared_memory_app: MemoryApp | None = None
+        if user_id is not None:
+            memory_config = replace(load_memory_config(), user_id=user_id)
+            self._shared_memory_app = MemoryApp(
+                memory_config,
+                start_worker=True,
+                close_database_connections=close_database_connections,
+            )
+        uses_shared_memory = self._shared_memory_app is not None
         self._anchor = AgentRunner(
             workspace=None,
             session_id=session_id,
             label="System",
-            start_worker=True,
+            memory_app=self._shared_memory_app,
+            start_worker=not uses_shared_memory,
+            owns_memory_app=not uses_shared_memory,
+            console=console or AgentConsole(),
         )
         self._root_session_id: str | None = None
+        self._opened = False
 
-    async def run(self) -> None:
+    async def open(self) -> SubmitResult:
+        """初始化工作区与 memory，返回当前阶段说明。"""
         ensure_agent_workspaces(self.project_root, self.agent_specs)
-        self.console.print_status(f"多 Agent 项目根目录：{self.project_root}")
+        memory_session_id = await self._ensure_root_session_id()
+        self._opened = True
 
-        try:
-            if self.continue_maintenance:
-                await self._start_maintenance_from_continue()
-                return
+        messages: list[AgentReply] = [
+            AgentReply(
+                role="status",
+                content=f"多 Agent 项目根目录：{self.project_root}",
+            )
+        ]
 
-            await self._requirements_phase()
-            if self.phase is not Phase.PROTOTYPE:
-                return
-            await self._prototype_phase()
-            if self.phase is not Phase.BACKEND:
-                return
-            await self._backend_phase()
-            if self.phase is not Phase.INTEGRATION:
-                return
-            await self._integration_phase()
-            if self.phase is not Phase.MAINTENANCE:
-                return
-            await self._maintenance_phase()
-        finally:
-            await self._close_agents()
-
-    async def _start_maintenance_from_continue(self) -> None:
-        if not is_project_ready_for_maintenance(self.project_root):
-            self.console.print_error(
-                "无法进入维护模式",
-                RuntimeError(
+        if self.continue_maintenance:
+            if not is_project_ready_for_maintenance(self.project_root):
+                raise RuntimeError(
                     "未找到项目产物。请先完成开发流程，"
                     "或确保存在 docs/requirements.md、backend/docs/openapi.yaml 或 frontend/。"
-                ),
+                )
+            self._apply_project_context(load_project_context(self.project_root))
+            self.phase = Phase.MAINTENANCE
+            messages.append(AgentReply(role="status", content="检测到已有项目产物，已进入维护阶段。"))
+            messages.append(AgentReply(role="status", content=_phase_hint(self.phase)))
+        else:
+            messages.append(AgentReply(role="status", content=_phase_hint(self.phase)))
+
+        return SubmitResult(
+            phase=self.phase,
+            phase_changed=False,
+            memory_session_id=memory_session_id,
+            messages=messages,
+        )
+
+    def apply_persisted_state(
+        self,
+        *,
+        phase: Phase,
+        confirmed_requirements: str | None = None,
+        confirmed_prototype: str | None = None,
+        backend_result: str | None = None,
+    ) -> None:
+        """从持久化记录恢复协调状态。"""
+        self.phase = phase
+        self.confirmed_requirements = confirmed_requirements
+        self.confirmed_prototype = confirmed_prototype
+        self.backend_result = backend_result
+
+    async def restore(self) -> str:
+        """服务重启后恢复会话，不重复发送 bootstrap 消息。"""
+        ensure_agent_workspaces(self.project_root, self.agent_specs)
+        memory_session_id = await self._ensure_root_session_id()
+        self._opened = True
+
+        if self.phase is Phase.MAINTENANCE or self.continue_maintenance:
+            if is_project_ready_for_maintenance(self.project_root):
+                self._apply_project_context(load_project_context(self.project_root))
+
+        return memory_session_id
+
+    async def set_project_root(self, project_root: Path) -> None:
+        """修改项目工作目录，并重建各子 Agent 的工作区绑定。"""
+        if not self._opened:
+            raise RuntimeError("MultiAgentRunner 尚未 open()，请先初始化会话。")
+
+        self.project_root = project_root.expanduser().resolve()
+        ensure_agent_workspaces(self.project_root, self.agent_specs)
+
+        for agent in self._sub_agents.values():
+            await agent.close()
+        self._sub_agents.clear()
+
+        if self._coordinator is not None:
+            await self._coordinator.close()
+            self._coordinator = None
+
+        if self.phase is Phase.MAINTENANCE or self.continue_maintenance:
+            self._apply_project_context(load_project_context(self.project_root))
+
+    async def submit(self, message: str) -> SubmitResult:
+        """处理一条用户消息并返回 Agent 回复与阶段状态。"""
+        if not self._opened:
+            raise RuntimeError("MultiAgentRunner 尚未 open()，请先初始化会话。")
+
+        phase_before = self.phase
+        memory_session_id = await self._ensure_root_session_id()
+        messages: list[AgentReply] = []
+        requirements_form: dict | None = None
+
+        if self.phase is Phase.REQUIREMENTS:
+            messages, requirements_form = await self._submit_requirements(message)
+        elif self.phase is Phase.PROTOTYPE:
+            messages.extend(await self._submit_prototype(message))
+        elif self.phase is Phase.BACKEND:
+            messages.extend(await self._submit_backend(message))
+        elif self.phase is Phase.INTEGRATION:
+            messages.extend(await self._submit_integration(message))
+        elif self.phase is Phase.MAINTENANCE:
+            messages.extend(await self._submit_maintenance(message))
+
+        phase_changed = self.phase is not phase_before
+        if phase_changed:
+            messages.append(AgentReply(role="status", content=_phase_hint(self.phase)))
+
+        return SubmitResult(
+            phase=self.phase,
+            phase_changed=phase_changed,
+            memory_session_id=memory_session_id,
+            messages=messages,
+            requirements_form=requirements_form,
+        )
+
+    async def submit_stream(self, message: str) -> AsyncIterator[StreamEvent]:
+        """处理用户消息并以 SSE 事件流式返回执行过程。"""
+        if not self._opened:
+            raise RuntimeError("MultiAgentRunner 尚未 open()，请先初始化会话。")
+
+        queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
+        stream_console = StreamingAgentConsole(queue)
+        previous_console = self._console
+        self._apply_console(stream_console)
+
+        async def worker() -> SubmitResult:
+            try:
+                return await self.submit(message)
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(worker())
+        try:
+            yield StreamEvent("started", {"message": message, "phase": self.phase.value})
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield event
+            result = await task
+            if result.requirements_form is not None:
+                yield StreamEvent("form", result.requirements_form)
+            yield StreamEvent(
+                "done",
+                {
+                    "memory_session_id": result.memory_session_id,
+                    "phase": result.phase.value,
+                    "phase_changed": result.phase_changed,
+                    "requirements_form": result.requirements_form,
+                    "messages": [
+                        {
+                            "role": item.role,
+                            "content": item.content,
+                            "agent": item.agent,
+                        }
+                        for item in result.messages
+                    ],
+                },
             )
-            return
+        except Exception as error:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            yield StreamEvent("error", {"detail": str(error)})
+        finally:
+            self._apply_console(previous_console or SilentAgentConsole())
 
-        self._apply_project_context(load_project_context(self.project_root))
-        self.console.print_status("检测到已有项目产物，直接进入维护阶段。")
-        await self._maintenance_phase()
+    async def run(self) -> None:
+        """CLI 交互循环。"""
+        result = await self.open()
+        self._render_result(result)
+        try:
+            while True:
+                input_text = await self._read_user_input()
+                if input_text is None:
+                    return
+                self.console.print_user_message(input_text)
+                result = await self.submit(input_text)
+                self._render_result(result)
+        finally:
+            await self.close()
 
-    def _apply_project_context(self, context: dict[str, str | None]) -> None:
-        self.confirmed_requirements = context.get("confirmed_requirements")
-        self.confirmed_prototype = context.get("confirmed_prototype")
-        self.backend_result = context.get("backend_result")
-
-    async def _requirements_phase(self) -> None:
-        self.console.print_status(
-            "【阶段 1/4】需求确认：与产品经理对话。"
-            "输入「确认需求」进入样品开发；输入 exit 退出。"
-        )
+    async def _submit_requirements(self, message: str) -> tuple[list[AgentReply], dict | None]:
         product_manager = await self._get_sub_agent(PRODUCT_MANAGER_SPEC)
+        result = await product_manager.run_task(message)
+        replies = [AgentReply(role="assistant", content=result, agent=PRODUCT_MANAGER_SPEC.display_name)]
+        requirements_form: dict | None = None
 
-        while self.phase is Phase.REQUIREMENTS:
-            input_text = await self._read_user_input()
-            if input_text is None:
-                return
+        if _should_confirm_requirements(message, result):
+            self.confirmed_requirements = result
+            self.phase = Phase.PROTOTYPE
+            replies.append(AgentReply(role="status", content="需求已确认，进入样品开发阶段。"))
+            replies.extend(await self._bootstrap_prototype())
+        elif needs_clarification(result):
+            try:
+                requirements_form = await generate_clarification_form(result)
+            except Exception as error:
+                self.console.print_error("需求澄清表单生成失败", error)
 
-            self.console.print_user_message(input_text)
-            result = await product_manager.run_task(input_text)
+        return replies, requirements_form
 
-            if _should_confirm_requirements(input_text, result):
-                self.confirmed_requirements = result
-                self.phase = Phase.PROTOTYPE
-                self.console.print_status("需求已确认，进入样品开发阶段。")
-                return
-
-    async def _prototype_phase(self) -> None:
-        self.console.print_status(
-            "【阶段 2/4】样品开发：前端 Agent 将用 Mock 数据搭建页面。"
-            "可多次提出修改；输入「确认样品」进入后端开发；输入 exit 退出。"
+    async def _submit_prototype(self, message: str) -> list[AgentReply]:
+        frontend = await self._get_sub_agent(
+            FRONTEND_SPEC,
+            role_key="prototype",
+            role_prompt=FRONTEND_PROTOTYPE_ROLE_PROMPT,
         )
+        result = await frontend.run_task(message)
+        replies = [AgentReply(role="assistant", content=result, agent=FRONTEND_SPEC.display_name)]
+
+        if _should_confirm_prototype(message, result):
+            self.confirmed_prototype = result
+            self.phase = Phase.BACKEND
+            replies.append(AgentReply(role="status", content="样品已确认，进入后端接口开发阶段。"))
+            replies.extend(await self._bootstrap_backend())
+        return replies
+
+    async def _submit_backend(self, message: str) -> list[AgentReply]:
+        if _should_start_integration(message):
+            self.phase = Phase.INTEGRATION
+            replies = [AgentReply(role="status", content="进入前端接口对接阶段。")]
+            replies.extend(await self._bootstrap_integration())
+            return replies
+
+        backend = await self._get_sub_agent(BACKEND_SPEC)
+        result = await backend.run_task(
+            _enrich_backend_task(
+                confirmed_requirements=self.confirmed_requirements,
+                confirmed_prototype=self.confirmed_prototype,
+                frontend_workspace=str(resolve_agent_workspace(self.project_root, FRONTEND_SPEC)),
+                task=message,
+            )
+        )
+        self.backend_result = result
+        return [AgentReply(role="assistant", content=result, agent=BACKEND_SPEC.display_name)]
+
+    async def _submit_integration(self, message: str) -> list[AgentReply]:
+        if _should_start_maintenance(message):
+            self.phase = Phase.MAINTENANCE
+            return [AgentReply(role="status", content="开发流程完成，进入维护阶段。")]
+
+        frontend = await self._get_sub_agent(
+            FRONTEND_SPEC,
+            role_key="integration",
+            role_prompt=FRONTEND_INTEGRATION_ROLE_PROMPT,
+        )
+        result = await frontend.run_task(
+            _enrich_integration_task(
+                confirmed_requirements=self.confirmed_requirements,
+                confirmed_prototype=self.confirmed_prototype,
+                backend_result=self.backend_result,
+                backend_workspace=str(resolve_agent_workspace(self.project_root, BACKEND_SPEC)),
+                task=message,
+            )
+        )
+        return [AgentReply(role="assistant", content=result, agent=FRONTEND_SPEC.display_name)]
+
+    async def _submit_maintenance(self, message: str) -> list[AgentReply]:
+        coordinator = await self._get_coordinator()
+        delegate_schemas = build_delegate_tool_schemas(self.agent_specs)
+        result = await coordinator.run_task(
+            message,
+            extra_tool_schemas=delegate_schemas,
+            tool_handler=self._handle_maintenance_delegate,
+        )
+        return [AgentReply(role="assistant", content=result, agent="协调员")]
+
+    async def _bootstrap_prototype(self) -> list[AgentReply]:
         frontend = await self._get_sub_agent(
             FRONTEND_SPEC,
             role_key="prototype",
@@ -177,62 +414,27 @@ class MultiAgentRunner:
             ),
             confirmed_requirements=self.confirmed_requirements,
         )
-        self.console.print_status("正在生成初始样品...")
-        await frontend.run_task(initial_task)
+        result = await frontend.run_task(initial_task)
+        return [
+            AgentReply(role="status", content="正在生成初始样品..."),
+            AgentReply(role="assistant", content=result, agent=FRONTEND_SPEC.display_name),
+        ]
 
-        while self.phase is Phase.PROTOTYPE:
-            input_text = await self._read_user_input()
-            if input_text is None:
-                return
-
-            self.console.print_user_message(input_text)
-            result = await frontend.run_task(input_text)
-
-            if _should_confirm_prototype(input_text, result):
-                self.confirmed_prototype = result
-                self.phase = Phase.BACKEND
-                self.console.print_status("样品已确认，进入后端接口开发阶段。")
-                return
-
-    async def _backend_phase(self) -> None:
-        self.console.print_status(
-            "【阶段 3/4】后端开发：根据需求与样品 Mock 数据结构实现 API。"
-            "完成后输入「开始对接」进入前端集成；输入 exit 退出。"
-        )
+    async def _bootstrap_backend(self) -> list[AgentReply]:
         backend = await self._get_sub_agent(BACKEND_SPEC)
         initial_task = _enrich_backend_task(
             confirmed_requirements=self.confirmed_requirements,
             confirmed_prototype=self.confirmed_prototype,
             frontend_workspace=str(resolve_agent_workspace(self.project_root, FRONTEND_SPEC)),
         )
-        self.console.print_status("正在开发后端接口...")
-        self.backend_result = await backend.run_task(initial_task)
+        result = await backend.run_task(initial_task)
+        self.backend_result = result
+        return [
+            AgentReply(role="status", content="正在开发后端接口..."),
+            AgentReply(role="assistant", content=result, agent=BACKEND_SPEC.display_name),
+        ]
 
-        while self.phase is Phase.BACKEND:
-            input_text = await self._read_user_input()
-            if input_text is None:
-                return
-
-            if _should_start_integration(input_text):
-                self.phase = Phase.INTEGRATION
-                self.console.print_status("进入前端接口对接阶段。")
-                return
-
-            self.console.print_user_message(input_text)
-            self.backend_result = await backend.run_task(
-                _enrich_backend_task(
-                    confirmed_requirements=self.confirmed_requirements,
-                    confirmed_prototype=self.confirmed_prototype,
-                    frontend_workspace=str(resolve_agent_workspace(self.project_root, FRONTEND_SPEC)),
-                    task=input_text,
-                )
-            )
-
-    async def _integration_phase(self) -> None:
-        self.console.print_status(
-            "【阶段 4/4】前端对接：将 Mock 数据替换为真实 API 调用。"
-            "可继续提出修改；输入「进入维护」进入维护阶段；输入 exit 退出。"
-        )
+    async def _bootstrap_integration(self) -> list[AgentReply]:
         frontend = await self._get_sub_agent(
             FRONTEND_SPEC,
             role_key="integration",
@@ -244,42 +446,16 @@ class MultiAgentRunner:
             backend_result=self.backend_result,
             backend_workspace=str(resolve_agent_workspace(self.project_root, BACKEND_SPEC)),
         )
-        self.console.print_status("正在对接前端与后端接口...")
-        await frontend.run_task(initial_task)
+        result = await frontend.run_task(initial_task)
+        return [
+            AgentReply(role="status", content="正在对接前端与后端接口..."),
+            AgentReply(role="assistant", content=result, agent=FRONTEND_SPEC.display_name),
+        ]
 
-        while self.phase is Phase.INTEGRATION:
-            input_text = await self._read_user_input()
-            if input_text is None:
-                return
-
-            if _should_start_maintenance(input_text):
-                self.phase = Phase.MAINTENANCE
-                self.console.print_status("开发流程完成，进入维护阶段。")
-                return
-
-            self.console.print_user_message(input_text)
-            await frontend.run_task(
-                _enrich_integration_task(
-                    confirmed_requirements=self.confirmed_requirements,
-                    confirmed_prototype=self.confirmed_prototype,
-                    backend_result=self.backend_result,
-                    backend_workspace=str(resolve_agent_workspace(self.project_root, BACKEND_SPEC)),
-                    task=input_text,
-                )
-            )
-
-    async def _maintenance_phase(self) -> None:
-        self.console.print_status(
-            "【维护阶段】描述需要修改的内容，Coordinator 会委派给合适的 Agent。"
-            "输入 exit 退出。"
-        )
-        coordinator = await self._get_coordinator()
-        delegate_schemas = build_delegate_tool_schemas(self.agent_specs)
-
-        await coordinator.run(
-            extra_tool_schemas=delegate_schemas,
-            tool_handler=self._handle_maintenance_delegate,
-        )
+    def _apply_project_context(self, context: dict[str, str | None]) -> None:
+        self.confirmed_requirements = context.get("confirmed_requirements")
+        self.confirmed_prototype = context.get("confirmed_prototype")
+        self.backend_result = context.get("backend_result")
 
     async def _handle_maintenance_delegate(
         self,
@@ -317,16 +493,15 @@ class MultiAgentRunner:
         else:
             sub_agent = await self._get_sub_agent(spec)
 
-        self.console.print_status(f"正在委派给 {spec.display_name}...")
         result = await sub_agent.run_task(enriched_task)
 
         if agent_name == PRODUCT_MANAGER_SPEC.name:
             if _response_is_confirmed(result):
                 self.confirmed_requirements = result
-                self.console.print_status("需求文档已更新。")
             else:
-                requirements_path = resolve_agent_workspace(self.project_root, PRODUCT_MANAGER_SPEC)
-                requirements_file = requirements_path / "requirements.md"
+                requirements_file = (
+                    resolve_agent_workspace(self.project_root, PRODUCT_MANAGER_SPEC) / "requirements.md"
+                )
                 if requirements_file.is_file():
                     self.confirmed_requirements = requirements_file.read_text(encoding="utf-8")
 
@@ -350,8 +525,10 @@ class MultiAgentRunner:
                 session_id=coordinator_session_id,
                 role_prompt=MAINTENANCE_COORDINATOR_ROLE_PROMPT,
                 label="协调员",
-                console=self.console,
+                memory_app=self._shared_memory_app,
                 start_worker=False,
+                owns_memory_app=False,
+                console=self.console,
             )
         return self._coordinator
 
@@ -380,8 +557,10 @@ class MultiAgentRunner:
                 session_id=agent_session_id,
                 role_prompt=role_prompt or spec.role_prompt,
                 label=spec.display_name,
-                console=self.console,
+                memory_app=self._shared_memory_app,
                 start_worker=False,
+                owns_memory_app=False,
+                console=self.console,
             )
         return self._sub_agents[cache_key]
 
@@ -390,16 +569,78 @@ class MultiAgentRunner:
             self._root_session_id, _ = await self._anchor.initialize()
         return self._root_session_id
 
-    async def _close_agents(self) -> None:
+    async def close(self) -> None:
         for agent in self._sub_agents.values():
             await agent.close()
         if self._coordinator is not None:
             await self._coordinator.close()
         await self._anchor.close()
+        if self._shared_memory_app is not None:
+            await self._shared_memory_app.close()
+        self._opened = False
+
+    def _render_result(self, result: SubmitResult) -> None:
+        for item in result.messages:
+            if item.role == "status":
+                self.console.print_status(item.content)
+            elif item.role == "assistant":
+                self.console.print_assistant_message(item.content, label=item.agent)
+
+    def _apply_console(self, console: AgentConsole) -> None:
+        self._console = console
+        self._anchor.console = console
+        for agent in self._sub_agents.values():
+            agent.console = console
+        if self._coordinator is not None:
+            self._coordinator.console = console
 
     @property
-    def console(self):
+    def console(self) -> AgentConsole:
+        if self._console is not None:
+            return self._console
         return self._anchor.console
+
+
+def create_api_runner(
+    *,
+    project_root: Path,
+    session_id: str | None = None,
+    continue_maintenance: bool = False,
+    user_id: str,
+) -> MultiAgentRunner:
+    return MultiAgentRunner(
+        project_root=project_root,
+        session_id=session_id,
+        continue_maintenance=continue_maintenance,
+        console=SilentAgentConsole(),
+        user_id=user_id,
+        close_database_connections=False,
+    )
+
+
+def _phase_hint(phase: Phase) -> str:
+    hints = {
+        Phase.REQUIREMENTS: (
+            "【阶段 1/4】需求确认：与产品经理对话。"
+            "输入「确认需求」进入样品开发。"
+        ),
+        Phase.PROTOTYPE: (
+            "【阶段 2/4】样品开发：前端 Agent 使用 Mock 数据。"
+            "输入「确认样品」进入后端开发。"
+        ),
+        Phase.BACKEND: (
+            "【阶段 3/4】后端开发：实现 API。"
+            "输入「开始对接」进入前端集成。"
+        ),
+        Phase.INTEGRATION: (
+            "【阶段 4/4】前端对接：替换 Mock 为真实 API。"
+            "输入「进入维护」进入维护阶段。"
+        ),
+        Phase.MAINTENANCE: (
+            "【维护阶段】描述修改内容，协调员将委派合适的 Agent。"
+        ),
+    }
+    return hints[phase]
 
 
 def _should_confirm_requirements(user_input: str, agent_response: str) -> bool:

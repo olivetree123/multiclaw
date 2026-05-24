@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from .file_tools import (
     FILE_TOOL_FUNCTIONS,
     FILE_TOOL_SCHEMAS,
